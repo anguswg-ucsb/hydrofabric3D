@@ -2078,3 +2078,120 @@ make_progress_bar <- function(progress, n) {
   return(make_progress)
 }
 
+
+#' Calculates hydraulic properties (i.e., channel perimiter, area, and hydraulic radius) of transect for fixed stage intervals
+#' @param df_group dataframe, contains a single transect points and attributes 
+#' @param increment numeric, the stage increment size in meters 
+#' @param num_points numeric, total number of point needed to be interpolated between each pair of points 
+#' @return dataframe, contianing stage varying hydrulic properties for single transect
+#' @export
+
+calculate_perimeter_area <- function(df_group, increment = 0.3048, num_points = 100) {
+  result <- tryCatch({
+    # Get the middle instance of 'bottom'
+    bottom_row <- df_group %>% filter(class == "bottom")
+    middle_index <- ceiling(nrow(bottom_row) / 2)
+    bottom_row <- bottom_row[middle_index, ]
+    
+    median_dist <- bottom_row$relative_distance
+    bottom_x <- bottom_row$X
+    bottom_y <- bottom_row$Y
+    
+    # Get maximum possible bank elevation values
+    left_b <- df_group %>% filter(relative_distance <= median_dist) %>% summarise(max(Z)) %>% pull()
+    right_b <- df_group %>% filter(relative_distance >= median_dist) %>% summarise(max(Z)) %>% pull()
+    max_elev <- min(left_b, right_b)
+    
+    # Calculate stages
+    min_elev <- min(df_group$Z)
+    total_inc <- floor((max_elev - min_elev) / increment) - 1 
+    # Make sure we have 0
+    if (total_inc <= 0) {
+      total_inc <- 0
+    }
+    # If no valid intervals (i.e., banks are lower than increment exit)
+    if (total_inc == 0) {
+      return(data.frame(longitude = bottom_x, latitude =bottom_y, stage = NA, perimeter = NA, 
+                        area = NA, hydraulic_radius = NA))
+    }
+    
+    stage_array <- seq(increment, increment * total_inc + increment,  by = increment)
+
+    points <- df_group %>% select(relative_distance, Z) %>% as.matrix()
+
+    # Interpolation in between points
+    interpolated_df <- do.call(rbind, lapply(1:(nrow(points) - 1), function(i) {
+      x1 <- points[i, 1]
+      y1 <- points[i, 2]
+      x2 <- points[i + 1, 1]
+      y2 <- points[i + 1, 2]
+      
+      data.frame(
+        relative_distance = seq(x1, x2, length.out = num_points + 2)[2:(num_points + 1)],
+        Z = seq(y1, y2, length.out = num_points + 2)[2:(num_points + 1)]
+      )
+    }))
+    
+    interpolated_df <- interpolated_df %>%
+      distinct() %>%
+      mutate(stage = Z - min_elev)
+    
+    # Calculate perimeter, area, and hydraulic radius
+    results <- do.call(rbind, lapply(stage_array, function(stage_val) {
+      filtered_df <- interpolated_df %>%
+        filter(stage <= stage_val) %>%
+        arrange(relative_distance)
+      
+      if (nrow(filtered_df) > 0) {
+        # Calculate perimeter (sum of relative distances)
+        filtered_df <- filtered_df %>%
+          mutate(distance = c(0, diff(relative_distance)))
+        
+        perimeter <- sum(filtered_df$distance)
+        
+        # Calculate area using trapezoidal rule
+        area <- trapz(filtered_df$stage, filtered_df$relative_distance)
+        h_radius <- area / perimeter
+        
+        data.frame(
+          longitude = bottom_x,
+          latitude = bottom_y,
+          stage = stage_val,
+          perimeter = perimeter,
+          area = area,
+          hydraulic_radius = h_radius
+        )
+      } else {
+        return(NULL)
+      }
+    }))
+    return(results)
+    
+  }, error = function(e) {
+    return(NULL)
+  })
+  
+  return(result)
+}
+
+#' A wrapper function to calculates hydraulic properties over a many transects 
+#' @param cs_table dataframe, contains a many/single transect points and attributes with varying hy_id and cs_id 
+#' @param increment numeric, the stage increment size in meters 
+#' @param num_points numeric, total number of point needed to be interpolated between each pair of points 
+#' @return dataframe, contianing stage varying hydrulic properties for all transect
+#' @export
+
+calculate_perimeter_area_wrapper <- function(cs_table, increment = 0.3048, num_points = 100) {
+  grouped <- cs_table %>%
+    group_by(hy_id, cs_id)
+  
+  all_results <- grouped %>%
+    group_modify(~ calculate_perimeter_area(.x, increment = increment, num_points = num_points)) %>%
+    filter(!is.null(.)) %>%  
+    ungroup() %>%
+    select(cs_id, hy_id, longitude, latitude, stage, perimeter, area, hydraulic_radius)
+  
+  return(all_results)
+}
+
+
